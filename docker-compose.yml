@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  signaling-server:
+    build: .
+    ports:
+      - "8765:8765"
+    restart: unless-stopped
+    container_name: webrtc-signaling-server
+
+  web-client:
+    build: .
+    # Serve the index.html on port 8000 using Python's built-in HTTP server
+    command: python -m http.server 8000
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    container_name: webrtc-web-client
+    depends_on:
+      - signaling-server
