@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>WebRTC Call</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: sans-serif;
+            background: #111;
+            color: #eee;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 24px;
+            gap: 16px;
+        }
+
+        h1 {
+            font-size: 1.4rem;
+            font-weight: 500;
+        }
+
+        .videos {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        video {
+            width: 420px;
+            max-width: 100%;
+            border-radius: 10px;
+            background: #222;
+            border: 1px solid #333;
+        }
+
+        .controls {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        input {
+            padding: 8px 12px;
+            border-radius: 6px;
+            border: 1px solid #444;
+            background: #1e1e1e;
+            color: #eee;
+            font-size: 14px;
+            width: 180px;
+        }
+
+        button {
+            padding: 8px 18px;
+            border-radius: 6px;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+            background: #2563eb;
+            color: #fff;
+        }
+
+        button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        button.danger {
+            background: #dc2626;
+        }
+
+        #status {
+            font-size: 13px;
+            color: #aaa;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>WebRTC Video Call</h1>
+    <p id="status">Disconnected</p>
+
+    <div class="controls">
+        <input id="room-input" placeholder="Room ID (e.g. room42)" />
+        <input id="ws-input" value="ws://localhost:8765" placeholder="Signaling server URL" />
+        <button id="join-btn">Join Room</button>
+        <button id="hangup-btn" class="danger" disabled>Hang Up</button>
+    </div>
+
+    <div class="videos">
+        <div>
+            <p style="text-align:center;margin-bottom:6px;font-size:13px">You</p>
+            <video id="local-video" autoplay muted playsinline></video>
+        </div>
+        <div>
+            <p style="text-align:center;margin-bottom:6px;font-size:13px">Remote</p>
+            <video id="remote-video" autoplay playsinline></video>
+        </div>
+    </div>
+
+    <script>
+        const STATUS = document.getElementById("status");
+        const joinBtn = document.getElementById("join-btn");
+        const hangupBtn = document.getElementById("hangup-btn");
+        const localVideo = document.getElementById("local-video");
+        const remoteVideo = document.getElementById("remote-video");
+
+        // ── Public STUN servers (Google). For production, add your TURN server here.
+        const ICE_SERVERS = {
+            iceServers: [
+                { urls: "stun:stun.l.google.com:19302" },
+                { urls: "stun:stun1.l.google.com:19302" },
+                // { urls: "turn:your-server.com:3478",
+                //   username: "user", credential: "pass" }  // ← add TURN for reliability
+            ]
+        };
+
+        let ws, pc, localStream;
+
+        function setStatus(msg) { STATUS.textContent = msg; }
+
+        // ── Start local camera/mic
+        async function startLocalStream() {
+            localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+            localVideo.srcObject = localStream;
+            return localStream;
+        }
+
+        // ── Create RTCPeerConnection
+        function createPeerConnection() {
+            pc = new RTCPeerConnection(ICE_SERVERS);
+
+            // Add local tracks to connection
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+            // When we get remote tracks, show them
+            pc.ontrack = (event) => {
+                remoteVideo.srcObject = event.streams[0];
+                setStatus("Connected — call in progress");
+            };
+
+            // Send ICE candidates through signaling server
+            pc.onicecandidate = (event) => {
+                if (event.candidate && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: "ice-candidate", candidate: event.candidate }));
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                setStatus(`Connection: ${pc.connectionState}`);
+                if (["disconnected", "failed", "closed"].includes(pc.connectionState)) {
+                    setStatus("Call ended");
+                }
+            };
+
+            return pc;
+        }
+
+        // ── Join button
+        joinBtn.addEventListener("click", async () => {
+            const room = document.getElementById("room-input").value.trim();
+            const wsUrl = document.getElementById("ws-input").value.trim();
+            if (!room) { alert("Enter a room ID"); return; }
+
+            setStatus("Getting camera/mic...");
+            await startLocalStream();
+
+            setStatus("Connecting to signaling server...");
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                ws.send(JSON.stringify({ type: "join", room }));
+                setStatus(`Joined room "${room}" — waiting for peer...`);
+                joinBtn.disabled = true;
+                hangupBtn.disabled = false;
+            };
+
+            ws.onmessage = async (event) => {
+                const msg = JSON.parse(event.data);
+
+                if (msg.type === "ready") {
+                    // We are the first peer — create and send the offer
+                    setStatus("Peer joined — starting call...");
+                    createPeerConnection();
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    ws.send(JSON.stringify({ type: "offer", sdp: pc.localDescription }));
+
+                } else if (msg.type === "offer") {
+                    // We are the second peer — respond with an answer
+                    createPeerConnection();
+                    await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    ws.send(JSON.stringify({ type: "answer", sdp: pc.localDescription }));
+
+                } else if (msg.type === "answer") {
+                    await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+
+                } else if (msg.type === "ice-candidate") {
+                    try { await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); }
+                    catch (e) { console.warn("ICE error", e); }
+
+                } else if (msg.type === "peer-left") {
+                    setStatus("Peer disconnected");
+                    remoteVideo.srcObject = null;
+
+                } else if (msg.type === "error") {
+                    alert(msg.message);
+                }
+            };
+
+            ws.onclose = () => setStatus("Signaling server disconnected");
+            ws.onerror = (e) => setStatus("WebSocket error — is the server running?");
+        });
+
+        // ── Hang up
+        hangupBtn.addEventListener("click", () => {
+            if (pc) { pc.close(); pc = null; }
+            if (ws) { ws.close(); }
+            if (localStream) { localStream.getTracks().forEach(t => t.stop()); }
+            localVideo.srcObject = null;
+            remoteVideo.srcObject = null;
+            joinBtn.disabled = false;
+            hangupBtn.disabled = true;
+            setStatus("Disconnected");
+        });
+    </script>
+</body>
+
+</html>
